@@ -13,7 +13,10 @@ import warp as wp
 from scipy.spatial import KDTree
 import pickle
 import cv2
-from pynput import keyboard
+try:
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
 import pyrender
 import trimesh
 import matplotlib.pyplot as plt
@@ -1070,8 +1073,11 @@ class InvPhyTrainerWarp:
             self.virtual_keys = {}     # Dictionary to track virtual keys with timestamps
             self.virtual_key_duration = 0.03  # Virtual key press duration in seconds
         
-        listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-        listener.start()
+        if keyboard is not None:
+            listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+            listener.start()
+        else:
+            listener = None
         self.target_change = np.zeros((n_ctrl_parts, 3))
 
         ############## Temporary timer ##############

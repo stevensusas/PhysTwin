@@ -38,6 +38,14 @@ exp_results/
 temp_experiments/
 gaussian_output/
 gaussian_output_video/
+outputs/
+vid2sim_dataset/
+
+# Symlinks to external data (in /opt/phystwin_data/)
+data
+experiments
+experiments_optimization
+gaussian_output
 gaussian_output_dynamic*
 interactive_my_test.py
 xarm/
