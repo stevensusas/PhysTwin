@@ -41,6 +41,7 @@ from gaussian_splatting.utils.graphics_utils import focal2fov
 from stage2.script_generate_fall_synthetic import (
     load_reference_data,
     simulate_fall_springmass,
+    simulate_interaction_springmass,
 )
 
 # Vid2Sim reference camera FOV (45 degrees)
@@ -486,23 +487,41 @@ def main():
     cfg.load_from_yaml(config_file)
     cfg.device = args.device
 
-    # --- Simulate free-fall ---
+    # --- Simulate interaction or free-fall ---
     logger.info(f"[Vid2Sim] Loading reference data from {args.data_path}")
     ref = load_reference_data(args.data_path, args.device)
     structure_points = ref["structure_points"]
     num_original_points = ref["num_original_points"]
 
-    logger.info(f"[Vid2Sim] Simulating free-fall ({args.num_sim_frames} frames, height={args.fall_height})")
-    object_points_array, floor_height, floor_axis = simulate_fall_springmass(
-        points=structure_points,
-        num_original_points=num_original_points,
-        num_frames=args.num_sim_frames,
-        device=args.device,
-        fall_height=args.fall_height,
-        data=ref["raw"],
-        checkpoint_path=args.springmass_checkpoint,
-        case_name=args.case_name,
-    )
+    raw_controller_points = ref["raw"].get("controller_points", None)
+    has_interaction = raw_controller_points is not None and raw_controller_points.shape[1] > 0
+
+    if has_interaction:
+        logger.info(
+            f"[Vid2Sim] Replaying interaction ({raw_controller_points.shape[0]} frames, "
+            f"N_ctrl={raw_controller_points.shape[1]})"
+        )
+        object_points_array, floor_height, floor_axis = simulate_interaction_springmass(
+            points=structure_points,
+            num_original_points=num_original_points,
+            device=args.device,
+            data=ref["raw"],
+            controller_points=raw_controller_points.astype(np.float32),
+            checkpoint_path=args.springmass_checkpoint,
+            case_name=args.case_name,
+        )
+    else:
+        logger.info(f"[Vid2Sim] Simulating free-fall ({args.num_sim_frames} frames, height={args.fall_height})")
+        object_points_array, floor_height, floor_axis = simulate_fall_springmass(
+            points=structure_points,
+            num_original_points=num_original_points,
+            num_frames=args.num_sim_frames,
+            device=args.device,
+            fall_height=args.fall_height,
+            data=ref["raw"],
+            checkpoint_path=args.springmass_checkpoint,
+            case_name=args.case_name,
+        )
     logger.info(f"[Vid2Sim] Simulation complete: {object_points_array.shape}")
 
     # --- Compute object center and extent for camera scaling ---
@@ -536,6 +555,18 @@ def main():
     ply_path = os.path.join(args.output_dir, "points3d.ply")
     export_points3d_ply(first_frame_pts * norm_scale, ply_path)
     logger.info(f"[Vid2Sim] Exported {first_frame_pts.shape[0]} points to {ply_path}")
+
+    # --- Export hand trajectory in Vid2Sim normalized coords ---
+    # Apply same transform as object: subtract object_center, multiply by norm_scale.
+    if has_interaction:
+        ctrl_norm = (raw_controller_points.astype(np.float32) - object_center[None, None, :]) * norm_scale
+        hand_traj_path = os.path.join(args.output_dir, "hand_trajectory.npy")
+        np.save(hand_traj_path, ctrl_norm)
+        logger.info(
+            f"[Vid2Sim] Exported hand trajectory: {ctrl_norm.shape} to {hand_traj_path}"
+        )
+    else:
+        logger.info("[Vid2Sim] No controller points found — skipping hand_trajectory.npy")
 
     # --- Free simulation memory ---
     n_nodes = len(structure_points)

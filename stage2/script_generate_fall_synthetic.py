@@ -281,6 +281,149 @@ def simulate_fall_springmass(
     return np.array(all_object_points), floor_height, 2
 
 
+def simulate_interaction_springmass(
+    points: torch.Tensor,
+    num_original_points: int,
+    device: str,
+    data: Dict[str, Any],
+    controller_points: np.ndarray,
+    checkpoint_path: str | None = None,
+    case_name: str = "unknown",
+) -> Tuple[np.ndarray, float, int]:
+    """Replay the original hand interaction using the Spring-Mass system.
+
+    Args:
+        points: structure_points at frame 0 (N_struct, 3).
+        num_original_points: number of object nodes (surface/interior excluded).
+        device: torch device string.
+        data: raw pkl data dict.
+        controller_points: (T, N_ctrl, 3) hand positions in world space.
+        checkpoint_path: optional path to trained spring_Y checkpoint.
+        case_name: used to locate experiments_optimization folder.
+
+    Returns:
+        object_points_array: (T, num_original_points, 3)
+        floor_height: 0.0 (no free-fall floor)
+        floor_axis: 2
+    """
+    cfg.data_type = "synthetic"
+    cfg.use_graph = False
+
+    num_frames = controller_points.shape[0]
+    N_ctrl = controller_points.shape[1]
+
+    # Load optimized topology parameters
+    optimal_path = f"experiments_optimization/{case_name}/optimal_params.pkl"
+    assert os.path.exists(optimal_path), f"Optimal parameters not found: {optimal_path}"
+    with open(optimal_path, "rb") as f:
+        optimal_params = pickle.load(f)
+    cfg.set_optimal_params(optimal_params)
+
+    pts_np = points.detach().cpu().numpy()
+    ctrl0_np = controller_points[0]  # (N_ctrl, 3) frame-0 hand positions
+
+    # Build spring topology: object-object springs + controller-object springs
+    tree = cKDTree(pts_np)
+    spring_flags = np.zeros((len(pts_np), len(pts_np)), dtype=np.uint8)
+    springs = []
+    rest_lengths = []
+
+    for i in range(len(pts_np)):
+        idx = tree.query_ball_point(pts_np[i], r=cfg.object_radius)
+        if i in idx:
+            idx.remove(i)
+        if cfg.object_max_neighbours is not None and len(idx) > cfg.object_max_neighbours:
+            idx = idx[:cfg.object_max_neighbours]
+        for j in idx:
+            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0:
+                rl = np.linalg.norm(pts_np[i] - pts_np[j])
+                if rl > 1e-4:
+                    spring_flags[i, j] = 1
+                    spring_flags[j, i] = 1
+                    springs.append([i, j])
+                    rest_lengths.append(rl)
+
+    num_object_points = len(pts_np)
+    # Controller-object springs
+    for i in range(N_ctrl):
+        idx = tree.query_ball_point(ctrl0_np[i], r=cfg.controller_radius)
+        if cfg.controller_max_neighbours is not None and len(idx) > cfg.controller_max_neighbours:
+            idx = idx[:cfg.controller_max_neighbours]
+        for j in idx:
+            springs.append([num_object_points + i, j])
+            rest_lengths.append(np.linalg.norm(ctrl0_np[i] - pts_np[j]))
+
+    all_pts = np.concatenate([pts_np, ctrl0_np], axis=0)
+    springs_t = torch.tensor(springs, dtype=torch.int32, device=device)
+    rest_lengths_t = torch.tensor(rest_lengths, dtype=torch.float32, device=device)
+    masses_t = torch.ones(len(all_pts), dtype=torch.float32, device=device)
+    all_pts_t = torch.tensor(all_pts, dtype=torch.float32, device=device)
+
+    # controller_points as (T, N_ctrl, 3) warp-compatible tensor
+    ctrl_torch = torch.tensor(controller_points, dtype=torch.float32, device=device)  # (T, N_ctrl, 3)
+
+    simulator = SpringMassSystemWarp(
+        init_vertices=all_pts_t,
+        init_springs=springs_t,
+        init_rest_lengths=rest_lengths_t,
+        init_masses=masses_t,
+        dt=cfg.dt,
+        num_substeps=cfg.num_substeps,
+        spring_Y=cfg.init_spring_Y,
+        collide_elas=cfg.collide_elas,
+        collide_fric=cfg.collide_fric,
+        dashpot_damping=cfg.dashpot_damping,
+        drag_damping=cfg.drag_damping,
+        collide_object_elas=cfg.collide_object_elas,
+        collide_object_fric=cfg.collide_object_fric,
+        collision_dist=cfg.collision_dist,
+        num_object_points=num_object_points,
+        controller_points=ctrl_torch,
+        reverse_z=cfg.reverse_z,
+        spring_Y_min=cfg.spring_Y_min,
+        spring_Y_max=cfg.spring_Y_max,
+        gt_object_points=torch.from_numpy(data["object_points"]).float().to(device),
+        gt_object_visibilities=torch.from_numpy(data["object_visibilities"]).float().to(device),
+        gt_object_motions_valid=torch.from_numpy(data["object_motions_valid"]).float().to(device),
+        self_collision=False,
+        disable_backward=True,
+    )
+
+    # Load trained spring stiffness (now topology matches since we include controller springs)
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        spring_Y = checkpoint["spring_Y"]
+        if len(spring_Y) == simulator.n_springs:
+            simulator.set_spring_Y(torch.log(spring_Y).detach().clone())
+            logger.info(f"[Interaction] Loaded trained spring_Y from {checkpoint_path}")
+        else:
+            logger.warning(
+                f"[Interaction] spring_Y mismatch: checkpoint={len(spring_Y)}, "
+                f"simulator={simulator.n_springs}. Using optimal_params defaults."
+            )
+
+    # Manually initialize control point warp buffers (normally done in "real" mode init).
+    simulator.wp_original_control_point = wp.from_torch(
+        ctrl_torch[0].clone(), dtype=wp.vec3, requires_grad=False
+    )
+    simulator.wp_target_control_point = wp.from_torch(
+        ctrl_torch[1].clone(), dtype=wp.vec3, requires_grad=False
+    )
+
+    simulator.set_init_state(simulator.wp_init_vertices, simulator.wp_init_velocities)
+    x0 = wp.to_torch(simulator.wp_init_vertices, requires_grad=False)
+    all_object_points = [x0.detach().cpu().numpy()[:num_original_points]]
+
+    for frame_idx in range(1, num_frames):
+        simulator.set_controller_target(frame_idx, pure_inference=True)
+        simulator.step()
+        x = wp.to_torch(simulator.wp_states[-1].wp_x, requires_grad=False)
+        all_object_points.append(x.detach().cpu().numpy()[:num_original_points])
+        simulator.set_init_state(simulator.wp_states[-1].wp_x, simulator.wp_states[-1].wp_v)
+
+    return np.array(all_object_points), 0.0, 2
+
+
 def render_matplotlib_video(
     object_points: np.ndarray,
     out_video_base: str,
