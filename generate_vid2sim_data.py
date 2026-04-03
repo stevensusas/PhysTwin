@@ -538,6 +538,7 @@ def main():
     logger.info(f"[Vid2Sim] Exported {first_frame_pts.shape[0]} points to {ply_path}")
 
     # --- Free simulation memory ---
+    n_nodes = len(structure_points)
     del ref, structure_points
     gc.collect()
     torch.cuda.empty_cache()
@@ -571,10 +572,25 @@ def main():
     # Vid2Sim/Kaolin convention: gravity force in -Z, floor is below (-Z side).
     # These are mirror images, so we negate the normalized floor level.
     floor_level_normalized = -abs((floor_height - object_center[floor_axis]) * norm_scale)
+    # Scale gravity by node count relative to double_stretch_zebra (g_ref=9.8).
+    # Heavier objects (more nodes) get more gravity to match GT fall speed.
+    G_REF = 9.8
+    _ref_data_path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(args.data_path)),
+        "..", "double_stretch_zebra", "final_data.pkl",
+    ))
+    if os.path.exists(_ref_data_path) and args.case_name != "double_stretch_zebra":
+        _ref_data = load_reference_data(_ref_data_path, args.device)
+        N_REF = len(_ref_data["structure_points"])
+        del _ref_data
+    else:
+        N_REF = n_nodes  # fallback: when processing double_stretch_zebra itself
+    gravity = float(G_REF * n_nodes / N_REF)
     sim_config = {
         "floor_level": float(floor_level_normalized),
         "floor_axis": int(floor_axis),
         "flip_floor": False,
+        "gravity": gravity,
     }
     sim_config_path = os.path.join(args.output_dir, "sim_config.yaml")
     import yaml
@@ -582,7 +598,7 @@ def main():
         yaml.dump(sim_config, f, default_flow_style=False)
     logger.info(
         f"[Vid2Sim] Wrote sim_config.yaml: floor_level={floor_level_normalized:.4f}, "
-        f"floor_axis={floor_axis}, flip_floor=False"
+        f"floor_axis={floor_axis}, flip_floor=False, gravity={gravity:.4f} (N={n_nodes})"
     )
 
     # --- Render frames ---
