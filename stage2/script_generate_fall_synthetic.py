@@ -109,27 +109,31 @@ def build_springmass_simulator(
     data: Dict[str, Any],
 ) -> SpringMassSystemWarp:
     """Create a SpringMassSystemWarp simulator for free-fall."""
+    import open3d as o3d
     pts_np = points.detach().cpu().numpy()
-    tree = cKDTree(pts_np)
+
+    # Use Open3D KDTree to match trainer_warp.py _init_start topology exactly,
+    # so the obj-obj spring count aligns with num_object_springs in the checkpoint.
+    object_pcd = o3d.geometry.PointCloud()
+    object_pcd.points = o3d.utility.Vector3dVector(pts_np)
+    pcd_tree = o3d.geometry.KDTreeFlann(object_pcd)
 
     springs = []
     rest_lengths = []
     spring_flags = np.zeros((len(pts_np), len(pts_np)), dtype=np.uint8)
 
     for i in range(len(pts_np)):
-        idx = tree.query_ball_point(pts_np[i], r=object_radius)
-        if i in idx:
-            idx.remove(i)
-        if object_max_neighbours is not None and len(idx) > object_max_neighbours:
-            idx = idx[:object_max_neighbours]
+        [k, idx, _] = pcd_tree.search_hybrid_vector_3d(
+            pts_np[i], object_radius, object_max_neighbours
+        )
+        idx = idx[1:]  # remove self
         for j in idx:
-            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0:
-                rest_length = np.linalg.norm(pts_np[i] - pts_np[j])
-                if rest_length > 1e-4:
-                    spring_flags[i, j] = 1
-                    spring_flags[j, i] = 1
-                    springs.append([i, j])
-                    rest_lengths.append(rest_length)
+            rest_length = np.linalg.norm(pts_np[i] - pts_np[j])
+            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0 and rest_length > 1e-4:
+                spring_flags[i, j] = 1
+                spring_flags[j, i] = 1
+                springs.append([i, j])
+                rest_lengths.append(rest_length)
 
     springs = torch.tensor(springs, dtype=torch.int32, device=device)
     rest_lengths = torch.tensor(rest_lengths, dtype=torch.float32, device=device)
@@ -250,20 +254,21 @@ def simulate_fall_springmass(
     )
 
    
-    # Try loading trained per-spring stiffness from checkpoint (best-effort).
-    # The checkpoint may have a different spring topology (trained with controller
-    # points that we don't use in free-fall), so we skip if counts don't match.
+    # Load trained per-spring stiffness from checkpoint.
+    # The checkpoint includes ctrl-obj springs that don't exist in free-fall, but
+    # num_object_springs marks where the obj-obj block ends — slice just that part.
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        spring_Y = checkpoint["spring_Y"]
-        if len(spring_Y) == simulator.n_springs:
-            simulator.set_spring_Y(torch.log(spring_Y).detach().clone())
-            logger.info(f"[Fall] Loaded trained spring_Y from {checkpoint_path}")
+        spring_Y_all = checkpoint["spring_Y"]
+        n_obj_springs = checkpoint.get("num_object_springs", len(spring_Y_all))
+        spring_Y_obj = spring_Y_all[:n_obj_springs]
+        if len(spring_Y_obj) == simulator.n_springs:
+            simulator.set_spring_Y(torch.log(spring_Y_obj).detach().clone())
+            logger.info(f"[Fall] Loaded trained spring_Y ({n_obj_springs} obj-obj springs) from {checkpoint_path}")
         else:
             logger.warning(
-                f"[Fall] Skipping checkpoint spring_Y: checkpoint has {len(spring_Y)} springs, "
-                f"simulator has {simulator.n_springs}. Topology mismatch (likely due to "
-                f"controller points used during training). Using optimal_params defaults."
+                f"[Fall] Skipping checkpoint spring_Y: obj-obj block has {n_obj_springs} springs, "
+                f"simulator has {simulator.n_springs}. Using optimal_params defaults."
             )
 
     simulator.set_init_state(simulator.wp_init_vertices, simulator.wp_init_velocities)
@@ -319,36 +324,39 @@ def simulate_interaction_springmass(
         optimal_params = pickle.load(f)
     cfg.set_optimal_params(optimal_params)
 
+    import open3d as o3d
     pts_np = points.detach().cpu().numpy()
     ctrl0_np = controller_points[0]  # (N_ctrl, 3) frame-0 hand positions
 
-    # Build spring topology: object-object springs + controller-object springs
-    tree = cKDTree(pts_np)
+    # Build spring topology using the same Open3D KDTree as trainer_warp.py _init_start,
+    # so the spring count matches the checkpoint and per-spring stiffnesses load correctly.
+    object_pcd = o3d.geometry.PointCloud()
+    object_pcd.points = o3d.utility.Vector3dVector(pts_np)
+    pcd_tree = o3d.geometry.KDTreeFlann(object_pcd)
+
     spring_flags = np.zeros((len(pts_np), len(pts_np)), dtype=np.uint8)
     springs = []
     rest_lengths = []
 
     for i in range(len(pts_np)):
-        idx = tree.query_ball_point(pts_np[i], r=cfg.object_radius)
-        if i in idx:
-            idx.remove(i)
-        if cfg.object_max_neighbours is not None and len(idx) > cfg.object_max_neighbours:
-            idx = idx[:cfg.object_max_neighbours]
+        [k, idx, _] = pcd_tree.search_hybrid_vector_3d(
+            pts_np[i], cfg.object_radius, cfg.object_max_neighbours
+        )
+        idx = idx[1:]  # remove self
         for j in idx:
-            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0:
-                rl = np.linalg.norm(pts_np[i] - pts_np[j])
-                if rl > 1e-4:
-                    spring_flags[i, j] = 1
-                    spring_flags[j, i] = 1
-                    springs.append([i, j])
-                    rest_lengths.append(rl)
+            rl = np.linalg.norm(pts_np[i] - pts_np[j])
+            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0 and rl > 1e-4:
+                spring_flags[i, j] = 1
+                spring_flags[j, i] = 1
+                springs.append([i, j])
+                rest_lengths.append(rl)
 
     num_object_points = len(pts_np)
-    # Controller-object springs
+    # Controller-object springs (same Open3D tree, matching trainer's hybrid search)
     for i in range(N_ctrl):
-        idx = tree.query_ball_point(ctrl0_np[i], r=cfg.controller_radius)
-        if cfg.controller_max_neighbours is not None and len(idx) > cfg.controller_max_neighbours:
-            idx = idx[:cfg.controller_max_neighbours]
+        [k, idx, _] = pcd_tree.search_hybrid_vector_3d(
+            ctrl0_np[i], cfg.controller_radius, cfg.controller_max_neighbours
+        )
         for j in idx:
             springs.append([num_object_points + i, j])
             rest_lengths.append(np.linalg.norm(ctrl0_np[i] - pts_np[j]))
