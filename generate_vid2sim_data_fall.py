@@ -489,23 +489,13 @@ def main():
     logger.info(f"[Vid2Sim] Wrote transform JSON files (norm_scale={norm_scale:.4f})")
 
     floor_level_normalized = -abs((floor_height - object_center[floor_axis]) * norm_scale)
-    G_REF = 9.8
-    _ref_data_path = os.path.normpath(os.path.join(
-        os.path.dirname(os.path.abspath(args.data_path)),
-        "..", "double_stretch_zebra", "final_data.pkl",
-    ))
-    if os.path.exists(_ref_data_path) and args.case_name != "double_stretch_zebra":
-        _ref_data = load_reference_data(_ref_data_path, args.device)
-        N_REF = len(_ref_data["structure_points"])
-        del _ref_data
-    else:
-        N_REF = n_nodes
-    gravity = float(G_REF * n_nodes / N_REF)
+    gravity = 9.8
     sim_config = {
         "floor_level": float(floor_level_normalized),
         "floor_axis": int(floor_axis),
         "flip_floor": False,
         "gravity": gravity,
+        "n_nodes": int(n_nodes),
     }
     sim_config_path = os.path.join(args.output_dir, "sim_config.yaml")
     import yaml
